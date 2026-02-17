@@ -1,1 +1,9 @@
 node_modules/
+.env
+.omc/
+.claude/
+.cursor/
+dist/
+build/
+*.log
+.DS_Store
