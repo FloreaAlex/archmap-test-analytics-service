@@ -1,0 +1,22 @@
+{
+  "name": "archmap-test-analytics-service",
+  "version": "1.0.0",
+  "description": "Analytics service for ArchMap test architecture - event-sourced metrics from Kafka",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@florea-alex/order-events-schemas": "github:FloreaAlex/order-events-schemas",
+    "express": "^4.18.2",
+    "kafkajs": "^2.2.4",
+    "pg": "^8.11.3",
+    "uuid": "^9.0.0",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4"
+  }
+}
