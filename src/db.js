@@ -39,27 +39,49 @@ function getPool() {
 }
 
 /**
- * Run database migrations from migrations/ directory
+ * Run database migrations from migrations/ directory.
+ * Tracks applied migrations in a schema_migrations table to prevent
+ * re-running already-applied migrations (safe for ALTER TABLE, etc.).
  */
 async function runMigrations() {
-  const client = getPool();
+  const pool = getPool();
 
   try {
+    // Ensure the schema_migrations tracking table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        filename TEXT PRIMARY KEY,
+        applied_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )
+    `);
+
     const migrationsDir = path.join(__dirname, '..', 'migrations');
     const files = await fs.readdir(migrationsDir);
     const sqlFiles = files.filter(f => f.endsWith('.sql')).sort();
 
+    // Get already-applied migrations
+    const applied = await pool.query('SELECT filename FROM schema_migrations');
+    const appliedSet = new Set(applied.rows.map(r => r.filename));
+
+    const pending = sqlFiles.filter(f => !appliedSet.has(f));
+
     logger.info('Running database migrations', {
-      count: sqlFiles.length,
-      files: sqlFiles
+      total: sqlFiles.length,
+      alreadyApplied: appliedSet.size,
+      pending: pending.length,
+      files: pending
     });
 
-    for (const file of sqlFiles) {
+    for (const file of pending) {
       const filePath = path.join(migrationsDir, file);
       const sql = await fs.readFile(filePath, 'utf-8');
 
       logger.info('Executing migration', { file });
-      await client.query(sql);
+      await pool.query(sql);
+      await pool.query(
+        'INSERT INTO schema_migrations (filename) VALUES ($1)',
+        [file]
+      );
       logger.info('Migration completed', { file });
     }
 

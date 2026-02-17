@@ -4,9 +4,11 @@ const logger = require('./logger');
 /**
  * Insert an event into events_log. Returns the inserted row id, or null if duplicate.
  * Uses ON CONFLICT DO NOTHING for idempotency.
+ * Accepts an optional client for transaction support.
  */
-async function insertEvent(eventType, orderId, userId, correlationId, data) {
-  const result = await getPool().query(
+async function insertEvent(eventType, orderId, userId, correlationId, data, client) {
+  const db = client || getPool();
+  const result = await db.query(
     `INSERT INTO events_log (event_type, order_id, user_id, correlation_id, data)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (event_type, order_id) DO NOTHING
@@ -18,8 +20,9 @@ async function insertEvent(eventType, orderId, userId, correlationId, data) {
 
 /**
  * UPSERT daily_metrics for a given date with increments.
+ * Accepts an optional client for transaction support.
  */
-async function upsertDailyMetrics(date, increments) {
+async function upsertDailyMetrics(date, increments, client) {
   const {
     ordersCreated = 0,
     ordersConfirmed = 0,
@@ -31,7 +34,8 @@ async function upsertDailyMetrics(date, increments) {
     paymentFailureCount = 0
   } = increments;
 
-  await getPool().query(
+  const db = client || getPool();
+  await db.query(
     `INSERT INTO daily_metrics (date, orders_created, orders_confirmed, orders_cancelled, orders_shipped, revenue_confirmed, revenue_cancelled, payment_success_count, payment_failure_count)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (date) DO UPDATE SET
@@ -48,24 +52,28 @@ async function upsertDailyMetrics(date, increments) {
 }
 
 /**
- * UPSERT hourly_order_counts for a given hour bucket.
+ * UPSERT hourly_order_counts using date_trunc('hour', NOW()) in SQL
+ * to avoid timezone inconsistencies from JS-computed hour buckets.
  */
-async function upsertHourlyMetrics(hourBucket, orderCountIncrement, revenueIncrement) {
-  await getPool().query(
+async function upsertHourlyMetrics(orderCountIncrement, revenueIncrement, client) {
+  const db = client || getPool();
+  await db.query(
     `INSERT INTO hourly_order_counts (hour_bucket, order_count, revenue)
-     VALUES ($1, $2, $3)
+     VALUES (date_trunc('hour', NOW()), $1, $2)
      ON CONFLICT (hour_bucket) DO UPDATE SET
        order_count = hourly_order_counts.order_count + EXCLUDED.order_count,
        revenue = hourly_order_counts.revenue + EXCLUDED.revenue`,
-    [hourBucket, orderCountIncrement, revenueIncrement]
+    [orderCountIncrement, revenueIncrement]
   );
 }
 
 /**
  * UPSERT product_metrics for a given product.
+ * Accepts an optional client for transaction support.
  */
-async function upsertProductMetrics(productId, quantitySold, revenue, now) {
-  await getPool().query(
+async function upsertProductMetrics(productId, quantitySold, revenue, now, client) {
+  const db = client || getPool();
+  await db.query(
     `INSERT INTO product_metrics (product_id, total_quantity_sold, total_revenue, order_count, last_ordered_at)
      VALUES ($1, $2, $3, 1, $4)
      ON CONFLICT (product_id) DO UPDATE SET
@@ -120,8 +128,8 @@ async function getOverview() {
     averageOrderValue: totalOrders > 0 ? (totalRevenue / totalOrders).toFixed(2) : '0.00',
     paymentSuccessRate: paymentTotal > 0 ? parseFloat(((paymentSuccess / paymentTotal) * 100).toFixed(1)) : 0,
     ordersByStatus: {
-      created: totalOrders - parseInt(totals.orders_confirmed, 10) - parseInt(totals.orders_cancelled, 10),
-      confirmed: parseInt(totals.orders_confirmed, 10) - parseInt(totals.orders_shipped, 10),
+      created: Math.max(0, totalOrders - parseInt(totals.orders_confirmed, 10) - parseInt(totals.orders_cancelled, 10)),
+      confirmed: Math.max(0, parseInt(totals.orders_confirmed, 10) - parseInt(totals.orders_shipped, 10)),
       shipped: parseInt(totals.orders_shipped, 10),
       cancelled: parseInt(totals.orders_cancelled, 10)
     },

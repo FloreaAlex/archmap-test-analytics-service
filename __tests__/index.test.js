@@ -1,16 +1,23 @@
 // Set NODE_ENV to test BEFORE requiring anything
 process.env.NODE_ENV = 'test';
 
-// Mock pg module
+// Mock pg module with both pool.query (for read endpoints) and pool.connect (for transactions)
 const mockQuery = jest.fn();
 const mockEnd = jest.fn();
 const mockOn = jest.fn();
+const mockClientQuery = jest.fn();
+const mockClientRelease = jest.fn();
+const mockConnect = jest.fn().mockResolvedValue({
+  query: mockClientQuery,
+  release: mockClientRelease
+});
 
 jest.mock('pg', () => ({
   Pool: jest.fn().mockImplementation(() => ({
     query: mockQuery,
     end: mockEnd,
     on: mockOn,
+    connect: mockConnect,
   })),
 }));
 
@@ -27,6 +34,13 @@ const app = require('../src/index');
 describe('Analytics Service', () => {
   beforeEach(() => {
     mockQuery.mockClear();
+    mockClientQuery.mockClear();
+    mockClientRelease.mockClear();
+    mockConnect.mockClear();
+    mockConnect.mockResolvedValue({
+      query: mockClientQuery,
+      release: mockClientRelease
+    });
   });
 
   // ---- Health Check ----
@@ -160,6 +174,32 @@ describe('Analytics Service', () => {
       expect(data.paymentSuccessRate).toBe(0);
       expect(data.todayOrders).toBe(0);
       expect(data.todayRevenue).toBe('0.00');
+    });
+
+    it('should clamp negative ordersByStatus to zero', async () => {
+      // Simulate inconsistent data where confirmed > total_orders
+      mockQuery
+        .mockResolvedValueOnce({
+          rows: [{
+            total_orders: '10', orders_confirmed: '12', orders_cancelled: '3',
+            orders_shipped: '15', total_revenue: '500.00',
+            payment_success: '10', payment_failure: '2'
+          }]
+        })
+        .mockResolvedValueOnce({
+          rows: [{ today_orders: '1', today_revenue: '50.00' }]
+        });
+
+      const response = await request(app)
+        .get('/analytics/overview')
+        .set('x-user-role', 'admin');
+
+      expect(response.status).toBe(200);
+      const status = response.body.data.ordersByStatus;
+      // created = max(0, 10 - 12 - 3) = 0 (not -5)
+      expect(status.created).toBe(0);
+      // confirmed = max(0, 12 - 15) = 0 (not -3)
+      expect(status.confirmed).toBe(0);
     });
 
     it('should return 500 on database error', async () => {
@@ -406,24 +446,31 @@ describe('Analytics Service', () => {
 
 // ---- Event Processor Tests ----
 describe('Event Processor', () => {
-  // We need a fresh require with fresh mocks for processor tests
-  const repository = require('../src/repository');
-
   beforeEach(() => {
     mockQuery.mockClear();
+    mockClientQuery.mockClear();
+    mockClientRelease.mockClear();
+    mockConnect.mockClear();
+    mockConnect.mockResolvedValue({
+      query: mockClientQuery,
+      release: mockClientRelease
+    });
   });
 
   describe('processEvent', () => {
-    // Import after mocks are set up
     const { processEvent } = require('../src/processor');
 
-    it('should process order.created event', async () => {
+    it('should process order.created event in a transaction', async () => {
+      // BEGIN
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
       // insertEvent returns id (not duplicate)
-      mockQuery.mockResolvedValueOnce({ rows: [{ id: 1 }] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [{ id: 1 }] });
       // upsertDailyMetrics
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
       // upsertHourlyMetrics
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
+      // COMMIT
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
 
       const event = {
         type: 'order.created',
@@ -434,20 +481,30 @@ describe('Event Processor', () => {
 
       const result = await processEvent(event, 'test-corr');
       expect(result).toBe(true);
-      expect(mockQuery).toHaveBeenCalledTimes(3);
+      // BEGIN + insertEvent + dailyMetrics + hourlyMetrics + COMMIT = 5
+      expect(mockClientQuery).toHaveBeenCalledTimes(5);
+      // Verify BEGIN and COMMIT were called
+      expect(mockClientQuery.mock.calls[0][0]).toBe('BEGIN');
+      expect(mockClientQuery.mock.calls[4][0]).toBe('COMMIT');
+      // Verify client was released
+      expect(mockClientRelease).toHaveBeenCalledTimes(1);
     });
 
     it('should process order.confirmed event with product metrics', async () => {
+      // BEGIN
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
       // insertEvent
-      mockQuery.mockResolvedValueOnce({ rows: [{ id: 2 }] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [{ id: 2 }] });
       // upsertDailyMetrics
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
       // upsertHourlyMetrics
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
       // upsertProductMetrics for item 1
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
       // upsertProductMetrics for item 2
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
+      // COMMIT
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
 
       const event = {
         type: 'order.confirmed',
@@ -464,13 +521,16 @@ describe('Event Processor', () => {
 
       const result = await processEvent(event, 'test-corr');
       expect(result).toBe(true);
-      // insertEvent + daily + hourly + 2 product metrics = 5
-      expect(mockQuery).toHaveBeenCalledTimes(5);
+      // BEGIN + insertEvent + daily + hourly + 2 product metrics + COMMIT = 7
+      expect(mockClientQuery).toHaveBeenCalledTimes(7);
+      expect(mockClientRelease).toHaveBeenCalledTimes(1);
     });
 
     it('should process order.cancelled event', async () => {
-      mockQuery.mockResolvedValueOnce({ rows: [{ id: 3 }] });
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // BEGIN
+      mockClientQuery.mockResolvedValueOnce({ rows: [{ id: 3 }] }); // insertEvent
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // upsertDailyMetrics
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // COMMIT
 
       const event = {
         type: 'order.cancelled',
@@ -481,12 +541,16 @@ describe('Event Processor', () => {
 
       const result = await processEvent(event, 'test-corr');
       expect(result).toBe(true);
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      // BEGIN + insertEvent + dailyMetrics + COMMIT = 4
+      expect(mockClientQuery).toHaveBeenCalledTimes(4);
+      expect(mockClientRelease).toHaveBeenCalledTimes(1);
     });
 
     it('should process order.shipped event', async () => {
-      mockQuery.mockResolvedValueOnce({ rows: [{ id: 4 }] });
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // BEGIN
+      mockClientQuery.mockResolvedValueOnce({ rows: [{ id: 4 }] }); // insertEvent
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // upsertDailyMetrics
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // COMMIT
 
       const event = {
         type: 'order.shipped',
@@ -497,12 +561,15 @@ describe('Event Processor', () => {
 
       const result = await processEvent(event, 'test-corr');
       expect(result).toBe(true);
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(mockClientQuery).toHaveBeenCalledTimes(4);
+      expect(mockClientRelease).toHaveBeenCalledTimes(1);
     });
 
     it('should process payment.authorized event', async () => {
-      mockQuery.mockResolvedValueOnce({ rows: [{ id: 5 }] });
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // BEGIN
+      mockClientQuery.mockResolvedValueOnce({ rows: [{ id: 5 }] }); // insertEvent
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // upsertDailyMetrics
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // COMMIT
 
       const event = {
         type: 'payment.authorized',
@@ -513,12 +580,15 @@ describe('Event Processor', () => {
 
       const result = await processEvent(event, 'test-corr');
       expect(result).toBe(true);
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(mockClientQuery).toHaveBeenCalledTimes(4);
+      expect(mockClientRelease).toHaveBeenCalledTimes(1);
     });
 
     it('should process payment.failed event', async () => {
-      mockQuery.mockResolvedValueOnce({ rows: [{ id: 6 }] });
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // BEGIN
+      mockClientQuery.mockResolvedValueOnce({ rows: [{ id: 6 }] }); // insertEvent
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // upsertDailyMetrics
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // COMMIT
 
       const event = {
         type: 'payment.failed',
@@ -529,12 +599,15 @@ describe('Event Processor', () => {
 
       const result = await processEvent(event, 'test-corr');
       expect(result).toBe(true);
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(mockClientQuery).toHaveBeenCalledTimes(4);
+      expect(mockClientRelease).toHaveBeenCalledTimes(1);
     });
 
-    it('should skip duplicate events (idempotency)', async () => {
+    it('should skip duplicate events (idempotency) and rollback', async () => {
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // BEGIN
       // insertEvent returns no rows (conflict/duplicate)
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] });
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // ROLLBACK
 
       const event = {
         type: 'order.created',
@@ -545,8 +618,56 @@ describe('Event Processor', () => {
 
       const result = await processEvent(event, 'test-corr');
       expect(result).toBe(false);
-      // Only the insertEvent query should have been called
-      expect(mockQuery).toHaveBeenCalledTimes(1);
+      // BEGIN + insertEvent + ROLLBACK = 3
+      expect(mockClientQuery).toHaveBeenCalledTimes(3);
+      expect(mockClientQuery.mock.calls[2][0]).toBe('ROLLBACK');
+      // Client is always released
+      expect(mockClientRelease).toHaveBeenCalledTimes(1);
+    });
+
+    it('should rollback and release client on error', async () => {
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // BEGIN
+      // insertEvent succeeds
+      mockClientQuery.mockResolvedValueOnce({ rows: [{ id: 7 }] });
+      // upsertDailyMetrics throws
+      mockClientQuery.mockRejectedValueOnce(new Error('DB write error'));
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // ROLLBACK
+
+      const event = {
+        type: 'order.created',
+        orderId: 7,
+        userId: 10,
+        data: { items: [], totalAmount: 0 }
+      };
+
+      await expect(processEvent(event, 'test-corr')).rejects.toThrow('DB write error');
+      // Verify ROLLBACK was called
+      expect(mockClientQuery.mock.calls[3][0]).toBe('ROLLBACK');
+      // Client is always released
+      expect(mockClientRelease).toHaveBeenCalledTimes(1);
+    });
+
+    it('should use date_trunc in hourly metrics SQL (not JS hour bucket)', async () => {
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // BEGIN
+      mockClientQuery.mockResolvedValueOnce({ rows: [{ id: 8 }] }); // insertEvent
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // upsertDailyMetrics
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // upsertHourlyMetrics
+      mockClientQuery.mockResolvedValueOnce({ rows: [] }); // COMMIT
+
+      const event = {
+        type: 'order.created',
+        orderId: 8,
+        userId: 10,
+        data: { items: [], totalAmount: 0 }
+      };
+
+      await processEvent(event, 'test-corr');
+
+      // The hourly metrics query (4th call, index 3) should use date_trunc
+      const hourlyCall = mockClientQuery.mock.calls[3];
+      expect(hourlyCall[0]).toContain("date_trunc('hour', NOW())");
+      // Should only have 2 params (order_count, revenue), not 3 (no hourBucket)
+      expect(hourlyCall[1]).toHaveLength(2);
     });
   });
 });
